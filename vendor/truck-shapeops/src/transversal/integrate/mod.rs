@@ -59,11 +59,31 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // within tolerance).
     let poly_shell0 = shell0.robust_triangulation(tol);
     let poly_shell1 = shell1.robust_triangulation(tol);
+    // SolidCraft: only when the plain run gave up, run it again with the intersection vertices that
+    // the geometry puts at the end of an edge put there in the polygons too (see
+    // `loops_store::create_loops_stores_lenient`). What worked before is untouched.
+    process_pair_with(shell0, &poly_shell0, shell1, &poly_shell1, tol, lineage, false)
+        .or_else(|| process_pair_with(shell0, &poly_shell0, shell1, &poly_shell1, tol, lineage, true))
+}
+
+fn process_pair_with<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell0: &Shell<Point3, C, S>,
+    poly_shell0: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+    shell1: &Shell<Point3, C, S>,
+    poly_shell1: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+    tol: f64,
+    lineage: &mut Lineage<C, S>,
+    lenient: bool,
+) -> Option<[Shell<Point3, C, S>; 2]> {
+    let stores = match lenient {
+        false => loops_store::create_loops_stores(shell0, poly_shell0, shell1, poly_shell1, tol, lineage),
+        true => loops_store::create_loops_stores_lenient(shell0, poly_shell0, shell1, poly_shell1, tol, lineage),
+    };
     let loops_store::LoopsStoreQuadruple {
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
         ..
-    } = crate::tr!(loops_store::create_loops_stores(shell0, &poly_shell0, shell1, &poly_shell1, tol, lineage), "loops stores");
+    } = crate::tr!(stores, "loops stores");
     let mut cls0 = crate::tr!(divide_face::divide_faces(shell0, &loops_store0, tol, lineage), "divide faces 0");
     cls0.integrate_by_component();
     let mut cls1 = crate::tr!(divide_face::divide_faces(shell1, &loops_store1, tol, lineage), "divide faces 1");
