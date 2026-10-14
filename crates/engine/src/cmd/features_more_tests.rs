@@ -656,6 +656,29 @@ fn loft_joined_onto_a_box_exports_one_connected_mesh() {
     assert_eq!(pieces.len(), 1);
 }
 
+/// A loft section that is a ring (a profile with a hole) was lofted by its outer outline alone: a solid,
+/// with no error. It is refused; two circles left to the default selection are every region of the
+/// sketch, a disc, as with Extrude.
+#[test]
+fn a_loft_section_with_a_hole_is_refused_not_built_solid() {
+    let mut s = Session::default();
+    for (name, offset) in [("A", 0), ("B", 20)] {
+        run(&mut s, "sketch.create", json!({"plane": "XY", "offset": offset, "name": name}));
+        run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 20}));
+        run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 12}));
+        run(&mut s, "sketch.finish", json!({}));
+    }
+    let ring = json!([{"point": [16, 0]}]);
+    let sections = json!([{"sketch": "A", "profiles": ring}, {"sketch": "B", "profiles": ring}]);
+    let error = s.execute("solid.loft", &json!({"sections": sections, "operation": "new"})).expect_err("a ring section is refused").to_string();
+    assert!(error.contains("not supported yet") && error.contains("hole"), "{error}");
+    assert_eq!(measure(&mut s)["body_count"], 0, "nothing was built");
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": "A"}, {"sketch": "B"}], "operation": "new"}));
+    let want = std::f64::consts::PI * 400.0 * 20.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
 /// A cone that takes only a 1 mm chamfer off a cylinder's top edge leaves nearly all of the
 /// cylinder inside it; the intersection is still the chamfered cylinder (#443).
 #[test]
