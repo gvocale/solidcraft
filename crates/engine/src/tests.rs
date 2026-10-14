@@ -254,6 +254,7 @@ fn join_of_two_overlapping_rings_is_not_refused() {
 
 mod boolean_diagnostics;
 mod component_frames;
+mod edge_end_vertex;
 mod large_step_import;
 mod loft_cut;
 mod loft_spacing;

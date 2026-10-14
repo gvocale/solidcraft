@@ -311,12 +311,19 @@ impl<P: Copy + Tolerance, C: Clone> LoopsStore<P, C> {
         loops_index: usize,
         v: &Vertex<P>,
         emap: &mut HashMap<EdgeID<C>, Edge<P, C>>,
+        forced: Option<ParameterKind>,
     ) -> Option<(usize, usize, ParameterKind)>
     where
         C: Cut<Point = P> + SearchParameter<D1, Point = P>,
     {
         let pt = v.point();
         let (wire_index, edge_index, kind) = self[loops_index].search_parameter(pt)?;
+        // SolidCraft: `forced` is the end of the edge that the vertex sits on in the geometry,
+        // when the polygon puts it inside the edge (see `end_of_edge`).
+        let kind = match (kind, forced) {
+            (ParameterKind::Inner(_), Some(end)) => end,
+            _ => kind,
+        };
         match kind {
             ParameterKind::Front => {
                 let old_vertex = self[loops_index][wire_index][edge_index]
@@ -343,6 +350,40 @@ impl<P: Copy + Tolerance, C: Clone> LoopsStore<P, C> {
 }
 
 impl<C> LoopsStore<Point3, C> {
+    /// SolidCraft: the end of its edge that the intersection vertex `pv` sits on, when the polygon
+    /// search puts it inside an edge of `polygons` but an end vertex of the same edge (in `self`,
+    /// whose loops match the polygons') lies on `another_surface` within `tol` of it. The meshes
+    /// the polygons come from are coarse: an intersection curve found on another pair of faces can
+    /// end a hair away from a vertex that an earlier one placed, and splitting the edge there (at
+    /// its own end) fails, which gave up the whole boolean. Only surfaces are evaluated: the edge's
+    /// own curve may be an intersection curve, whose evaluation panics where it cannot project.
+    fn end_of_edge<S>(
+        &self,
+        polygons: &LoopsStore<Point3, PolylineCurve>,
+        loops_index: usize,
+        pv: &Vertex<Point3>,
+        another_surface: &S,
+        tol: f64,
+    ) -> Option<ParameterKind>
+    where
+        S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
+    {
+        let (wire_index, edge_index, kind) = polygons[loops_index].search_parameter(pv.point())?;
+        if !matches!(kind, ParameterKind::Inner(_)) {
+            return None;
+        }
+        let edge = self.get(loops_index)?.get(wire_index)?.get(edge_index)?;
+        let on_surface = |pt: Point3| {
+            another_surface
+                .search_nearest_parameter(pt, None, 10)
+                .is_some_and(|(u, v)| another_surface.subs(u, v).near(&pt))
+        };
+        [(ParameterKind::Front, edge.absolute_front()), (ParameterKind::Back, edge.absolute_back())]
+            .into_iter()
+            .find(|(_, end)| end.point().distance(pv.point()) <= tol && on_surface(end.point()))
+            .map(|(end, _)| end)
+    }
+
     fn add_geom_vertex<S>(
         &mut self,
         (loops_index, wire_index, edge_index): (usize, usize, usize),
@@ -462,6 +503,47 @@ where
         + From<IntersectionCurve<PolylineCurve, S>>,
     S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
+    create_loops_stores_with(geom_shell0, poly_shell0, geom_shell1, poly_shell1, tol, lineage, false)
+}
+
+/// SolidCraft: [`create_loops_stores`], except that an intersection vertex that the geometry puts
+/// at an end of an edge is put there in the polygons too (see `end_of_edge`), where the polygons
+/// alone would split the edge a hair away from its end. Only worth a try after the plain one failed:
+/// it can move a result that works.
+pub fn create_loops_stores_lenient<C, S>(
+    geom_shell0: &Shell<Point3, C, S>,
+    poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    geom_shell1: &Shell<Point3, C, S>,
+    poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    tol: f64,
+    lineage: &mut Lineage<C, S>,
+) -> Option<LoopsStoreQuadruple<C>>
+where
+    C: SearchNearestParameter<D1, Point = Point3>
+        + SearchParameter<D1, Point = Point3>
+        + Cut<Point = Point3, Vector = Vector3>
+        + From<IntersectionCurve<PolylineCurve, S>>,
+    S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
+{
+    create_loops_stores_with(geom_shell0, poly_shell0, geom_shell1, poly_shell1, tol, lineage, true)
+}
+
+fn create_loops_stores_with<C, S>(
+    geom_shell0: &Shell<Point3, C, S>,
+    poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    geom_shell1: &Shell<Point3, C, S>,
+    poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    tol: f64,
+    lineage: &mut Lineage<C, S>,
+    lenient: bool,
+) -> Option<LoopsStoreQuadruple<C>>
+where
+    C: SearchNearestParameter<D1, Point = Point3>
+        + SearchParameter<D1, Point = Point3>
+        + Cut<Point = Point3, Vector = Vector3>
+        + From<IntersectionCurve<PolylineCurve, S>>,
+    S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
+{
     let mut geom_loops_store0: LoopsStore<_, _> = geom_shell0.face_iter().collect();
     let mut poly_loops_store0: LoopsStore<_, _> = poly_shell0.face_iter().collect();
     let mut geom_loops_store1: LoopsStore<_, _> = geom_shell1.face_iter().collect();
@@ -516,8 +598,9 @@ where
                     let mut pemap1 = HashMap::default();
                     let mut gemap0 = HashMap::default();
                     let mut gemap1 = HashMap::default();
+                    let forced = lenient.then(|| geom_loops_store0.end_of_edge(&poly_loops_store0, face_index0, &pv0, &surface1, tol)).flatten();
                     let idx00 =
-                        poly_loops_store0.add_polygon_vertex(face_index0, &pv0, &mut pemap0);
+                        poly_loops_store0.add_polygon_vertex(face_index0, &pv0, &mut pemap0, forced);
                     if let Some((wire_index, edge_index, kind)) = idx00 {
                         crate::tr!(geom_loops_store0.add_geom_vertex(
                             (face_index0, wire_index, edge_index),
@@ -530,8 +613,9 @@ where
                         let polyline = intersection_curve.editor().leader;
                         *polyline.first_mut().unwrap() = gv0.point();
                     }
+                    let forced = lenient.then(|| geom_loops_store0.end_of_edge(&poly_loops_store0, face_index0, &pv1, &surface1, tol)).flatten();
                     let idx01 =
-                        poly_loops_store0.add_polygon_vertex(face_index0, &pv1, &mut pemap1);
+                        poly_loops_store0.add_polygon_vertex(face_index0, &pv1, &mut pemap1, forced);
                     if let Some((wire_index, edge_index, kind)) = idx01 {
                         crate::tr!(geom_loops_store0.add_geom_vertex(
                             (face_index0, wire_index, edge_index),
@@ -544,8 +628,9 @@ where
                         let polyline = intersection_curve.editor().leader;
                         *polyline.last_mut().unwrap() = gv1.point();
                     }
+                    let forced = lenient.then(|| geom_loops_store1.end_of_edge(&poly_loops_store1, face_index1, &pv0, &surface0, tol)).flatten();
                     let idx10 =
-                        poly_loops_store1.add_polygon_vertex(face_index1, &pv0, &mut pemap0);
+                        poly_loops_store1.add_polygon_vertex(face_index1, &pv0, &mut pemap0, forced);
                     if let Some((wire_index, edge_index, kind)) = idx10 {
                         crate::tr!(geom_loops_store1.add_geom_vertex(
                             (face_index1, wire_index, edge_index),
@@ -558,8 +643,9 @@ where
                         let polyline = intersection_curve.editor().leader;
                         *polyline.first_mut().unwrap() = gv0.point();
                     }
+                    let forced = lenient.then(|| geom_loops_store1.end_of_edge(&poly_loops_store1, face_index1, &pv1, &surface0, tol)).flatten();
                     let idx11 =
-                        poly_loops_store1.add_polygon_vertex(face_index1, &pv1, &mut pemap1);
+                        poly_loops_store1.add_polygon_vertex(face_index1, &pv1, &mut pemap1, forced);
                     if let Some((wire_index, edge_index, kind)) = idx11 {
                         crate::tr!(geom_loops_store1.add_geom_vertex(
                             (face_index1, wire_index, edge_index),
